@@ -14,6 +14,18 @@ import openai
 from dataclasses import dataclass
 from dotenv import load_dotenv
 import os
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TradingSignal:
@@ -33,11 +45,11 @@ class OKXFuturesBot:
         self.passphrase = passphrase
         
         # OpenAI setup
-        openai.api_key = openai_key
+        self.openai_client = openai.Client(api_key=openai_key)  # Новый клиент OpenAI
         
         # Trading settings
-        self.symbol = "ETH-USDT-SWAP"  # ETH фьючерс
-        self.leverage = 100
+        self.symbol = "ETH-USDT-SWAP"
+        self.leverage = 20
         
         # Data storage
         self.candles_1m = []
@@ -97,7 +109,7 @@ class OKXFuturesBot:
                 data_1m = response_1m.json()
                 if data_1m['code'] == '0':
                     self.candles_1m = data_1m['data'][::-1]  # Reverse to get chronological order
-                    print(f"Loaded {len(self.candles_1m)} 1m candles")
+                    logger.info(f"Loaded {len(self.candles_1m)} 1m candles")
             
             # Get 5m candles
             params_5m = {
@@ -111,7 +123,7 @@ class OKXFuturesBot:
                 data_5m = response_5m.json()
                 if data_5m['code'] == '0':
                     self.candles_5m = data_5m['data'][::-1]
-                    print(f"Loaded {len(self.candles_5m)} 5m candles")
+                    logger.info(f"Loaded {len(self.candles_5m)} 5m candles")
                     
             # Get funding rate
             funding_url = f"{self.base_url}/api/v5/public/funding-rate"
@@ -121,10 +133,10 @@ class OKXFuturesBot:
                 funding_data = funding_response.json()
                 if funding_data['code'] == '0' and funding_data['data']:
                     self.funding_rate = float(funding_data['data'][0]['fundingRate'])
-                    print(f"Current funding rate: {self.funding_rate}")
+                    logger.info(f"Current funding rate: {self.funding_rate}")
                     
         except Exception as e:
-            print(f"Error getting historical data: {e}")
+            logger.error(f"Error getting historical data: {e}")
     
     def calculate_indicators(self) -> Dict:
         """Calculate technical indicators"""
@@ -142,7 +154,8 @@ class OKXFuturesBot:
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
+        # Защита от деления на ноль
+        rs = gain / (loss + 1e-10)  # Добавляем малую константу
         rsi = 100 - (100 / (1 + rs))
         
         # EMA
@@ -178,6 +191,81 @@ class OKXFuturesBot:
             'volume_avg': df['volume'].tail(20).mean()
         }
     
+    async def check_market_gaps(self) -> bool:
+        """Проверяет наличие рыночных гэпов на основе последних свечей."""
+        try:
+            if len(self.candles_1m) < 10:
+                logger.warning("Недостаточно данных для анализа гэпов")
+                return False
+
+            # Конвертируем свечи в DataFrame
+            df = pd.DataFrame(self.candles_1m, columns=['ts', 'o', 'h', 'l', 'c', 'vol', 'volCcy', 'volCcyQuote', 'confirm'])
+            df['close'] = df['c'].astype(float)
+
+            # Рассчитываем процентное изменение цены за последнюю минуту
+            last_candle = df['close'].iloc[-1]
+            prev_candle = df['close'].iloc[-2]
+            price_change_percent = abs((last_candle - prev_candle) / prev_candle) * 100
+
+            # Порог для гэпа (например, 1%)
+            gap_threshold = 1.0
+            if price_change_percent > gap_threshold:
+                logger.warning(f"Обнаружен рыночный гэп: {price_change_percent:.2f}% > {gap_threshold}%")
+                return True
+
+            # Проверка волатильности через ATR (Average True Range)
+            df['tr'] = np.maximum(df['h'].astype(float) - df['l'].astype(float),
+                                  np.maximum(abs(df['h'].astype(float) - df['c'].shift().astype(float)),
+                                            abs(df['l'].astype(float) - df['c'].shift().astype(float))))
+            atr = df['tr'].rolling(window=14).mean().iloc[-1]
+            atr_percent = (atr / last_candle) * 100
+
+            # Порог волатильности (например, 0.5% от текущей цены)
+            volatility_threshold = 0.5
+            if atr_percent > volatility_threshold:
+                logger.warning(f"Высокая волатильность: ATR {atr_percent:.2f}% > {volatility_threshold}%")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Ошибка при проверке гэпов: {e}")
+            return False
+    
+    async def check_liquidity(self, entry_price: float, position_size: float, side: str) -> bool:
+        """Проверяет ликвидность в ордербуке для входа в позицию."""
+        try:
+            if not self.orderbook:
+                logger.warning("Данные ордербука недоступны")
+                return False
+
+            # Извлекаем bid/ask из ордербука
+            bids = self.orderbook.get('bids', [])  # [[price, size], ...]
+            asks = self.orderbook.get('asks', [])  # [[price, size], ...]
+
+            # Рассчитываем необходимый объем в USDT
+            required_volume = position_size * entry_price
+
+            # Проверяем ликвидность в зависимости от стороны позиции
+            if side == "buy":
+                # Для покупки проверяем asks (продажи)
+                available_volume = sum(float(ask[1]) * float(ask[0]) for ask in asks if float(ask[0]) <= entry_price * 1.005)
+                if available_volume < required_volume:
+                    logger.warning(f"Недостаточная ликвидность для покупки: доступно ${available_volume:.2f}, требуется ${required_volume:.2f}")
+                    return False
+            else:  # side == "sell"
+                # Для продажи проверяем bids (покупки)
+                available_volume = sum(float(bid[1]) * float(bid[0]) for bid in bids if float(bid[0]) >= entry_price * 0.995)
+                if available_volume < required_volume:
+                    logger.warning(f"Недостаточная ликвидность для продажи: доступно ${available_volume:.2f}, требуется ${required_volume:.2f}")
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при проверке ликвидности: {e}")
+            return False
+    
     async def analyze_with_openai(self) -> Optional[TradingSignal]:
         """Send data to OpenAI for analysis"""
         try:
@@ -189,7 +277,7 @@ class OKXFuturesBot:
             recent_candles = self.candles_1m[-10:] if len(self.candles_1m) >= 10 else self.candles_1m
             
             prompt = f"""
-Ты опытный трейдер фьючерсов ETH-USDT с плечом 100x. Проанализируй следующие данные и дай торговую рекомендацию:
+Ты опытный трейдер фьючерсов ETH-USDT с плечом {self.leverage}x. Проанализируй следующие данные и дай торговую рекомендацию:
 
 ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ:
 - RSI(14): {indicators.get('rsi', 0):.2f}
@@ -222,14 +310,14 @@ class OKXFuturesBot:
 }}
 
 ВАЖНО: 
-- При плече 100x используй строгий риск-менеджмент
+- При плече {self.leverage}x используй строгий риск-менеджмент
 - Stop loss не более 0.5% от entry price
 - Take profit 1-3% от entry price
 - Размер позиции не более 10% депозита при низкой уверенности
 - Учитывай funding rate для длинных позиций
 """
 
-            response = openai.ChatCompletion.create(
+            response = self.openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=300,
@@ -252,11 +340,11 @@ class OKXFuturesBot:
                 )
                 return signal
             except json.JSONDecodeError:
-                print(f"Failed to parse OpenAI response: {ai_response}")
+                logger.error(f"Failed to parse OpenAI response: {ai_response}")
                 return None
                 
         except Exception as e:
-            print(f"OpenAI analysis error: {e}")
+            logger.error(f"OpenAI analysis error: {e}")
             return None
     
     async def get_account_balance(self):
@@ -268,13 +356,19 @@ class OKXFuturesBot:
             response = requests.get(self.base_url + request_path, headers=headers)
             if response.status_code == 200:
                 data = response.json()
+                logger.debug(f"Balance API response: {data}")  # Добавлено для отладки
                 if data['code'] == '0' and data['data']:
                     for balance in data['data'][0]['details']:
                         if balance['ccy'] == 'USDT':
                             return float(balance['availBal'])
+                    logger.warning(f"No USDT balance found in Trading Account: {data}")
+                else:
+                    logger.error(f"Invalid balance response: {data}")
+            else:
+                logger.error(f"HTTP Error: {response.status_code}")
             return 0
         except Exception as e:
-            print(f"Error getting balance: {e}")
+            logger.error(f"Error getting balance: {e}")
             return 0
     
     async def set_leverage(self, leverage: int):
@@ -298,14 +392,14 @@ class OKXFuturesBot:
             if response.status_code == 200:
                 data = response.json()
                 if data['code'] == '0':
-                    print(f"Leverage set to {leverage}x successfully")
+                    logger.info(f"Leverage set to {leverage}x successfully")
                     return True
                 else:
-                    print(f"Failed to set leverage: {data.get('msg', 'Unknown error')}")
+                    logger.error(f"Failed to set leverage: {data.get('msg', 'Unknown error')}")
             return False
             
         except Exception as e:
-            print(f"Error setting leverage: {e}")
+            logger.error(f"Error setting leverage: {e}")
             return False
     
     async def get_position_info(self):
@@ -338,7 +432,7 @@ class OKXFuturesBot:
             return None
             
         except Exception as e:
-            print(f"Error getting position info: {e}")
+            logger.error(f"Error getting position info: {e}")
             return None
     
     async def calculate_position_size(self, signal: TradingSignal):
@@ -346,31 +440,38 @@ class OKXFuturesBot:
         try:
             balance = await self.get_account_balance()
             if balance <= 0:
-                print("Insufficient balance")
+                logger.warning("Insufficient balance")
                 return 0
             
             # Calculate USD amount to trade
             risk_amount = balance * (signal.position_size_percent / 100)
             
-            # With 100x leverage, we can trade 100x the risk amount
+            # With leverage, we can trade more
             position_value = risk_amount * self.leverage
             
             # Convert to ETH size (OKX futures are quoted in ETH)
             position_size = position_value / signal.entry_price
             
-            # Round to appropriate precision (OKX ETH futures use 3 decimal places)
+            # Check minimum order size (0.01 ETH for ETH-USDT-SWAP)
+            min_order_size = 0.01
+            if position_size < min_order_size:
+                logger.warning(f"Position size {position_size:.3f} ETH is below minimum {min_order_size} ETH")
+                return 0
+            
+            # Round to appropriate precision
             position_size = round(position_size, 3)
             
-            print(f"Balance: ${balance:.2f}")
-            print(f"Risk amount: ${risk_amount:.2f}")
-            print(f"Position value: ${position_value:.2f}")
-            print(f"Position size: {position_size} ETH")
+            logger.info(f"Balance: ${balance:.2f}")
+            logger.info(f"Risk amount: ${risk_amount:.2f}")
+            logger.info(f"Position value: ${position_value:.2f}")
+            logger.info(f"Position size: {position_size} ETH")
             
             return position_size
             
         except Exception as e:
-            print(f"Error calculating position size: {e}")
+            logger.error(f"Error calculating position size: {e}")
             return 0
+            
     
     async def place_market_order(self, side: str, size: float, reduce_only: bool = False):
         """Place market order"""
@@ -401,18 +502,115 @@ class OKXFuturesBot:
                 data = response.json()
                 if data['code'] == '0' and data['data']:
                     order_info = data['data'][0]
-                    print(f"Order placed successfully: {order_info['ordId']}")
+                    logger.info(f"Order placed successfully: {order_info['ordId']}")
                     return order_info['ordId']
                 else:
-                    print(f"Order failed: {data.get('msg', 'Unknown error')}")
+                    logger.error(f"Order failed: {data.get('msg', 'Unknown error')}")
             else:
-                print(f"HTTP Error: {response.status_code}")
+                logger.error(f"HTTP Error: {response.status_code}")
             
             return None
             
         except Exception as e:
-            print(f"Error placing market order: {e}")
+            logger.error(f"Error placing market order: {e}")
             return None
+    
+    async def place_limit_order(self, side: str, size: float, price: float, reduce_only: bool = False):
+        """Размещает лимитный ордер для минимизации проскальзывания."""
+        try:
+            request_path = "/api/v5/trade/order"
+            
+            order_data = {
+                "instId": self.symbol,
+                "tdMode": "cross",
+                "side": side,
+                "ordType": "limit",
+                "sz": str(size),
+                "px": str(price),  # Цена лимитного ордера
+            }
+            
+            if reduce_only:
+                order_data["reduceOnly"] = "true"
+            
+            body = json.dumps(order_data)
+            headers = self.get_headers("POST", request_path, body)
+            
+            response = requests.post(
+                self.base_url + request_path,
+                headers=headers,
+                data=body
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data['code'] == '0' and data['data']:
+                    order_info = data['data'][0]
+                    logger.info(f"Лимитный ордер размещён: {order_info['ordId']} по цене {price}")
+                    return order_info['ordId']
+                else:
+                    logger.error(f"Ошибка размещения лимитного ордера: {data.get('msg', 'Unknown error')}")
+            else:
+                logger.error(f"HTTP Error: {response.status_code}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка при размещении лимитного ордера: {e}")
+            return None
+    
+    async def cancel_order(self, order_id: str):
+        """Отменяет ордер по его ID."""
+        try:
+            request_path = "/api/v5/trade/cancel-order"
+            body = json.dumps({
+                "instId": self.symbol,
+                "ordId": order_id
+            })
+            
+            headers = self.get_headers("POST", request_path, body)
+            
+            response = requests.post(
+                self.base_url + request_path,
+                headers=headers,
+                data=body
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data['code'] == '0':
+                    logger.info(f"Order {order_id} cancelled successfully")
+                    return True
+                else:
+                    logger.error(f"Failed to cancel order: {data.get('msg', 'Unknown error')}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error cancelling order: {e}")
+            return False
+    
+    async def check_slippage(self, order_id: str, expected_price: float) -> bool:
+        """Проверяет проскальзывание для ордера."""
+        try:
+            request_path = f"/api/v5/trade/order?ordId={order_id}"
+            headers = self.get_headers("GET", request_path)
+            
+            response = requests.get(self.base_url + request_path, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                if data['code'] == '0' and data['data']:
+                    fill_price = float(data['data'][0].get('fillPx', 0))
+                    if fill_price == 0:  # Ордер ещё не исполнен
+                        return True  # Считаем, что проскальзывания нет, пока ордер не исполнен
+                    slippage = abs((fill_price - expected_price) / expected_price) * 100
+                    slippage_threshold = 0.5  # Порог проскальзывания 0.5%
+                    if slippage > slippage_threshold:
+                        logger.warning(f"Проскальзывание {slippage:.2f}% превышает порог {slippage_threshold}%")
+                        return False
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка при проверке проскальзывания: {e}")
+            return False
     
     async def place_stop_loss_take_profit(self, side: str, size: float, stop_loss: float, take_profit: float):
         """Place stop loss and take profit orders"""
@@ -466,7 +664,7 @@ class OKXFuturesBot:
             return orders_placed
             
         except Exception as e:
-            print(f"Error placing SL/TP orders: {e}")
+            logger.error(f"Error placing SL/TP orders: {e}")
             return []
     
     async def _place_conditional_order(self, order_data: dict, order_type: str):
@@ -486,15 +684,15 @@ class OKXFuturesBot:
                 data = response.json()
                 if data['code'] == '0' and data['data']:
                     order_info = data['data'][0]
-                    print(f"{order_type} order placed: {order_info['algoId']}")
+                    logger.info(f"{order_type} order placed: {order_info['algoId']}")
                     return order_info['algoId']
                 else:
-                    print(f"{order_type} order failed: {data.get('msg', 'Unknown error')}")
+                    logger.error(f"{order_type} order failed: {data.get('msg', 'Unknown error')}")
             
             return None
             
         except Exception as e:
-            print(f"Error placing {order_type} order: {e}")
+            logger.error(f"Error placing {order_type} order: {e}")
             return None
     
     async def close_position(self, reason: str = "Signal"):
@@ -502,15 +700,15 @@ class OKXFuturesBot:
         try:
             position = await self.get_position_info()
             if not position:
-                print("No position to close")
+                logger.info("No position to close")
                 return True
             
             # Determine close side
             close_side = "sell" if position['side'] == "long" else "buy"
             
-            print(f"Closing position - Reason: {reason}")
-            print(f"Position: {position['side']} {position['size']} ETH")
-            print(f"Unrealized PnL: ${position['unrealized_pnl']:.2f}")
+            logger.info(f"Closing position - Reason: {reason}")
+            logger.info(f"Position: {position['side']} {position['size']} ETH")
+            logger.info(f"Unrealized PnL: ${position['unrealized_pnl']:.2f}")
             
             order_id = await self.place_market_order(
                 side=close_side,
@@ -519,7 +717,7 @@ class OKXFuturesBot:
             )
             
             if order_id:
-                print(f"Position closed successfully")
+                logger.info(f"Position closed successfully")
                 # Cancel any remaining SL/TP orders
                 await self.cancel_all_algo_orders()
                 return True
@@ -527,7 +725,7 @@ class OKXFuturesBot:
             return False
             
         except Exception as e:
-            print(f"Error closing position: {e}")
+            logger.error(f"Error closing position: {e}")
             return False
     
     async def cancel_all_algo_orders(self):
@@ -550,40 +748,40 @@ class OKXFuturesBot:
             if response.status_code == 200:
                 data = response.json()
                 if data['code'] == '0':
-                    print("All algo orders cancelled")
+                    logger.info("All algo orders cancelled")
                     return True
             
             return False
             
         except Exception as e:
-            print(f"Error cancelling algo orders: {e}")
+            logger.error(f"Error cancelling algo orders: {e}")
             return False
     
     async def place_order(self, signal: TradingSignal):
         """Place order based on trading signal"""
-        print(f"TRADING SIGNAL RECEIVED:")
-        print(f"Action: {signal.action}")
-        print(f"Confidence: {signal.confidence:.2f}")
-        print(f"Entry Price: {signal.entry_price:.2f}")
-        print(f"Stop Loss: {signal.stop_loss:.2f}")
-        print(f"Take Profit: {signal.take_profit:.2f}")
-        print(f"Position Size: {signal.position_size_percent}%")
-        print(f"Reasoning: {signal.reasoning}")
-        print("-" * 50)
+        logger.info(f"TRADING SIGNAL RECEIVED: Action={signal.action}, Confidence={signal.confidence:.2f}, "
+                    f"Entry Price={signal.entry_price:.2f}, Stop Loss={signal.stop_loss:.2f}, "
+                    f"Take Profit={signal.take_profit:.2f}, Position Size={signal.position_size_percent}%, "
+                    f"Reasoning={signal.reasoning}")
         
         try:
+            # Проверка на рыночные гэпы
+            if await self.check_market_gaps():
+                logger.warning("Торговля приостановлена из-за рыночного гэпа или высокой волатильности")
+                return
+            
             # Check current position
             current_position = await self.get_position_info()
             
             if signal.action == "hold":
-                print("Signal: HOLD - No action taken")
+                logger.info("Signal: HOLD - No action taken")
                 return
             
             elif signal.action == "close":
                 if current_position:
                     await self.close_position("AI Signal")
                 else:
-                    print("No position to close")
+                    logger.info("No position to close")
                 return
             
             elif signal.action in ["long", "short"]:
@@ -593,11 +791,11 @@ class OKXFuturesBot:
                     signal_side = "long" if signal.action == "long" else "short"
                     
                     if current_side != signal_side:
-                        print(f"Closing opposite position: {current_side}")
+                        logger.info(f"Closing opposite position: {current_side}")
                         await self.close_position("Opposite Signal")
                         await asyncio.sleep(2)  # Wait for close to complete
                     else:
-                        print(f"Already in {signal_side} position, skipping")
+                        logger.info(f"Already in {signal_side} position, skipping")
                         return
                 
                 # Set leverage if not set
@@ -607,16 +805,43 @@ class OKXFuturesBot:
                 # Calculate position size
                 position_size = await self.calculate_position_size(signal)
                 if position_size <= 0:
-                    print("Invalid position size, skipping trade")
+                    logger.warning("Invalid position size, skipping trade")
                     return
                 
-                # Place market order
+                # Проверка ликвидности
                 side = "buy" if signal.action == "long" else "sell"
-                order_id = await self.place_market_order(side, position_size)
+                if not await self.check_liquidity(signal.entry_price, position_size, side):
+                    logger.warning("Торговля приостановлена из-за недостаточной ликвидности")
+                    return
+                
+                # Place limit order instead of market order to minimize slippage
+                order_id = await self.place_limit_order(
+                    side=side,
+                    size=position_size,
+                    price=signal.entry_price
+                )
                 
                 if order_id:
-                    # Wait a bit for order to fill
-                    await asyncio.sleep(2)
+                    # Ожидание исполнения лимитного ордера (максимум 30 секунд)
+                    timeout = 30
+                    start_time = time.time()
+                    while time.time() - start_time < timeout:
+                        order_status = await self.check_slippage(order_id, signal.entry_price)
+                        if order_status:
+                            break
+                        await asyncio.sleep(2)
+                    
+                    # Если ордер не исполнен, отменяем его
+                    if time.time() - start_time >= timeout:
+                        logger.warning(f"Лимитный ордер {order_id} не исполнен за {timeout} секунд, отмена")
+                        await self.cancel_order(order_id)
+                        return
+                    
+                    # Проверка проскальзывания
+                    if not await self.check_slippage(order_id, signal.entry_price):
+                        logger.warning("Закрытие позиции из-за высокого проскальзывания")
+                        await self.close_position("High Slippage")
+                        return
                     
                     # Place stop loss and take profit
                     if signal.stop_loss > 0 or signal.take_profit > 0:
@@ -627,17 +852,17 @@ class OKXFuturesBot:
                             take_profit=signal.take_profit
                         )
                         
-                        print(f"SL/TP orders placed: {len(sl_tp_orders)}")
+                        logger.info(f"SL/TP orders placed: {len(sl_tp_orders)}")
                     
                     # Update current position info
                     self.current_position = await self.get_position_info()
                     if self.current_position:
-                        print(f"New position: {self.current_position}")
+                        logger.info(f"New position: {self.current_position}")
                 else:
-                    print("Failed to place market order")
+                    logger.error("Failed to place limit order")
         
         except Exception as e:
-            print(f"Error in place_order: {e}")
+            logger.error(f"Error in place_order: {e}")
     
     async def handle_websocket_message(self, message):
         """Handle incoming WebSocket messages"""
@@ -658,33 +883,45 @@ class OKXFuturesBot:
                         self.candles_5m.append(item)
                         if len(self.candles_5m) > 100:
                             self.candles_5m.pop(0)
+                    
+                    elif 'arg' in data and data['arg'].get('channel') == 'books50':
+                        self.orderbook = item  # Сохраняем данные ордербука
+                        logger.info(f"Обновлён ордербук: {len(item.get('bids', []))} bids, {len(item.get('asks', []))} asks")
+                    
+                    elif 'arg' in data and data['arg'].get('channel') == 'funding-rate':
+                        self.funding_rate = float(item.get('fundingRate', 0))
+                        logger.info(f"Обновлена ставка финансирования: {self.funding_rate:.6f}")
         
         except Exception as e:
-            print(f"Error handling WebSocket message: {e}")
+            logger.error(f"Error handling WebSocket message: {e}")
     
     async def websocket_client(self):
-        """WebSocket client for real-time data"""
-        try:
-            async with websockets.connect(self.ws_public_url) as websocket:
-                # Subscribe to channels
-                subscriptions = {
-                    "op": "subscribe",
-                    "args": [
-                        {"channel": "candle1m", "instId": self.symbol},
-                        {"channel": "candle5m", "instId": self.symbol},
-                        {"channel": "books5", "instId": self.symbol},
-                        {"channel": "funding-rate", "instId": self.symbol}
-                    ]
-                }
-                
-                await websocket.send(json.dumps(subscriptions))
-                print("Subscribed to WebSocket channels")
-                
-                async for message in websocket:
-                    await self.handle_websocket_message(message)
+        """WebSocket client для real-time данных с переподключением."""
+        reconnect_delay = 5
+
+        while True:
+            try:
+                async with websockets.connect(self.ws_public_url) as websocket:
+                    subscriptions = {
+                        "op": "subscribe",
+                        "args": [
+                            {"channel": "candle1m", "instId": self.symbol},
+                            {"channel": "candle5m", "instId": self.symbol},
+                            {"channel": "books50", "instId": self.symbol},  # Изменено на books50 для большей глубины
+                            {"channel": "funding-rate", "instId": self.symbol}
+                        ]
+                    }
                     
-        except Exception as e:
-            print(f"WebSocket error: {e}")
+                    await websocket.send(json.dumps(subscriptions))
+                    logger.info("Subscribed to WebSocket channels")
+                    
+                    async for message in websocket:
+                        await self.handle_websocket_message(message)
+            
+            except (websockets.exceptions.ConnectionClosed, Exception) as e:
+                logger.error(f"WebSocket error: {e}. Reconnecting in {reconnect_delay} seconds...")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)  # Экспоненциальная задержка, максимум 60 секунд
     
     async def analysis_loop(self):
         """Main analysis loop - runs every 60 seconds"""
@@ -692,7 +929,7 @@ class OKXFuturesBot:
             try:
                 current_time = time.time()
                 if current_time - self.last_analysis_time >= 60:  # Analyze every 60 seconds
-                    print(f"Running analysis at {datetime.now()}")
+                    logger.info(f"Running analysis at {datetime.now()}")
                     
                     signal = await self.analyze_with_openai()
                     if signal and signal.confidence >= 0.6:  # Only act on high confidence signals
@@ -703,22 +940,39 @@ class OKXFuturesBot:
                 await asyncio.sleep(5)  # Check every 5 seconds
                 
             except Exception as e:
-                print(f"Analysis loop error: {e}")
+                logger.error(f"Analysis loop error: {e}")
                 await asyncio.sleep(10)
     
     async def start(self):
         """Start the trading bot"""
-        print("Starting ETH-USDT Futures Trading Bot...")
+        logger.info("Starting ETH-USDT Futures Trading Bot...")
+        
+        # Check for open orders
+        try:
+            request_path = "/api/v5/trade/orders-pending"
+            headers = self.get_headers("GET", request_path)
+            response = requests.get(self.base_url + request_path, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                if data['code'] == '0' and data['data']:
+                    logger.warning(f"Found {len(data['data'])} open orders. Cancel them to free up balance.")
+            else:
+                logger.error(f"Error checking open orders: HTTP {response.status_code}, {response.text}")
+        except Exception as e:
+            logger.error(f"Error checking open orders: {e}")
         
         # Set initial leverage
         await self.set_leverage(self.leverage)
         
+        # Wait for balance synchronization
+        await asyncio.sleep(5)
+        
         # Check account balance
         balance = await self.get_account_balance()
-        print(f"Account balance: ${balance:.2f} USDT")
+        logger.info(f"Account balance: ${balance:.2f} USDT")
         
-        if balance < 10:  # Minimum balance check
-            print("Insufficient balance to start trading")
+        if balance < 10:  # Изменено с 20 на 10
+            logger.warning("Insufficient balance to start trading")
             return
         
         # Load initial historical data
@@ -727,22 +981,22 @@ class OKXFuturesBot:
         # Check for existing positions
         existing_position = await self.get_position_info()
         if existing_position:
-            print(f"Existing position found: {existing_position}")
+            logger.info(f"Existing position found: {existing_position}")
             self.current_position = existing_position
         
         # Start WebSocket and analysis tasks
         tasks = [
             asyncio.create_task(self.websocket_client()),
             asyncio.create_task(self.analysis_loop()),
-            asyncio.create_task(self.position_monitor())  # Add position monitoring
+            asyncio.create_task(self.position_monitor())
         ]
         
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            print("Bot stopped by user")
+            logger.info("Bot stopped by user")
         except Exception as e:
-            print(f"Bot error: {e}")
+            logger.error(f"Bot error: {e}")
     
     async def position_monitor(self):
         """Monitor position and manage risk"""
@@ -758,42 +1012,45 @@ class OKXFuturesBot:
                         position_value = updated_position['size'] * updated_position['mark_price']
                         pnl_percent = (unrealized_pnl / position_value) * 100 if position_value > 0 else 0
                         
-                        print(f"Position Status - Side: {updated_position['side']}, "
-                              f"Size: {updated_position['size']}, "
-                              f"PnL: ${unrealized_pnl:.2f} ({pnl_percent:.2f}%)")
+                        logger.info(f"Position Status - Side: {updated_position['side']}, "
+                                    f"Size: {updated_position['size']}, "
+                                    f"PnL: ${unrealized_pnl:.2f} ({pnl_percent:.2f}%)")
                         
-                        # Emergency stop if loss is too high (shouldn't happen with proper SL)
+                        # Emergency stop if loss is too high
                         if pnl_percent < -5:  # 5% loss emergency stop
-                            print("EMERGENCY STOP: Loss exceeded 5%")
+                            logger.warning("EMERGENCY STOP: Loss exceeded 5%")
                             await self.close_position("Emergency Stop")
                             self.current_position = None
                     else:
                         # Position was closed
                         if self.current_position:
-                            print("Position was closed")
+                            logger.info("Position was closed")
                             self.current_position = None
                 
                 await asyncio.sleep(10)  # Check every 10 seconds
                 
             except Exception as e:
-                print(f"Position monitor error: {e}")
+                logger.error(f"Position monitor error: {e}")
                 await asyncio.sleep(30)
 
 async def main():
-    # Загружаем переменные из .env
+    if not os.path.exists('.env'):
+        logger.error("File .env not found in current directory")
+        raise FileNotFoundError("File .env not found")
+    
     load_dotenv()
-
-    # Получаем ключи из переменных окружения
     api_key = os.getenv("OKX_API_KEY")
     secret_key = os.getenv("OKX_SECRET_KEY")
     passphrase = os.getenv("OKX_PASSPHRASE")
     openai_key = os.getenv("OPENAI_API_KEY")
-
-    # Проверяем, что все ключи загружены
+    
+    logger.debug(f"API Key: {api_key[:4] if api_key else None}****")
+    logger.debug(f"Secret Key: {secret_key[:4] if secret_key else None}****")
+    logger.debug(f"Passphrase: {passphrase[:4] if passphrase else None}****")
+    
     if not all([api_key, secret_key, passphrase, openai_key]):
         raise ValueError("One or more environment variables are missing in .env file")
 
-    # Инициализируем бот
     bot = OKXFuturesBot(
         api_key=api_key,
         secret_key=secret_key,
@@ -804,6 +1061,4 @@ async def main():
     await bot.start()
 
 if __name__ == "__main__":
-    # Убедитесь, что установлены все зависимости:
-    # pip install websockets pandas numpy openai requests python-dotenv
     asyncio.run(main())
