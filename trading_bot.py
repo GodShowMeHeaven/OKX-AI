@@ -307,14 +307,14 @@ class OKXFuturesBot:
     "stop_loss": цена_стопа,
     "take_profit": цена_профита,
     "position_size_percent": процент_от_депозита(1-20),
-    "reasoning": "краткое_обоснование"
+    "reasoning": "очень краткое_обоснование"
 }}
 
 ВАЖНО: 
 - При плече {self.leverage}x используй строгий риск-менеджмент
-- Stop loss не более 0.5% от entry price
-- Take profit 1-3% от entry price
-- Размер позиции не более 10% депозита при низкой уверенности
+- Stop loss не более 1-2% от entry price
+- Take profit 2-6% от entry price
+- Размер позиции не более 30% депозита при низкой уверенности
 - Учитывай funding rate для длинных позиций
 """
 
