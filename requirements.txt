@@ -5,3 +5,4 @@ pandas
 numpy
 openai>=1.0.0
 httpx
+websockets
