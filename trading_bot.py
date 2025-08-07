@@ -319,7 +319,7 @@ class OKXFuturesBot:
 """
 
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4.1",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=300,
                 temperature=0.1
