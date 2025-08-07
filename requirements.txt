@@ -1,6 +1,7 @@
-websockets
+requests
+websocket-client
+python-dotenv
 pandas
 numpy
-openai
-requests
-python-dotenv
+openai>=1.0.0
+httpx

@@ -1034,11 +1034,7 @@ class OKXFuturesBot:
                 await asyncio.sleep(30)
 
 async def main():
-    if not os.path.exists('.env'):
-        logger.error("File .env not found in current directory")
-        raise FileNotFoundError("File .env not found")
-    
-    load_dotenv()
+    load_dotenv()  # Для локальной разработки
     api_key = os.getenv("OKX_API_KEY")
     secret_key = os.getenv("OKX_SECRET_KEY")
     passphrase = os.getenv("OKX_PASSPHRASE")
@@ -1049,7 +1045,8 @@ async def main():
     logger.debug(f"Passphrase: {passphrase[:4] if passphrase else None}****")
     
     if not all([api_key, secret_key, passphrase, openai_key]):
-        raise ValueError("One or more environment variables are missing in .env file")
+        logger.error("Missing environment variables")
+        raise ValueError("One or more environment variables are missing")
 
     bot = OKXFuturesBot(
         api_key=api_key,
