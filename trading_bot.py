@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 import os
 import logging
+from datetime import datetime, timezone
 
 # Настройка логирования
 logging.basicConfig(
@@ -82,7 +83,7 @@ class OKXFuturesBot:
     
     def get_headers(self, method: str, request_path: str, body: str = ""):
         """Generate headers for OKX API requests"""
-        timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         signature = self.generate_signature(timestamp, method, request_path, body)
         
         return {
