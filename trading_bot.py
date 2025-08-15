@@ -192,39 +192,57 @@ class OKXFuturesBot:
             'volume_avg': df['volume'].tail(20).mean()
         }
     
+    def _has_gap(self, df: pd.DataFrame, threshold: float = 1.0) -> bool:
+        """Возвращает True, если последняя свеча образует ценовой гэп."""
+        last_candle = df['close'].iloc[-1]
+        prev_candle = df['close'].iloc[-2]
+        price_change_percent = abs((last_candle - prev_candle) / prev_candle) * 100
+        if price_change_percent > threshold:
+            logger.warning(
+                f"Обнаружен рыночный гэп: {price_change_percent:.2f}% > {threshold}%"
+            )
+            return True
+        return False
+
+    def _is_high_volatility(self, df: pd.DataFrame, last_close: float, threshold: float = 0.5) -> bool:
+        """Возвращает True при превышении порога ATR относительно цены."""
+        df['tr'] = np.maximum(
+            df['h'].astype(float) - df['l'].astype(float),
+            np.maximum(
+                abs(df['h'].astype(float) - df['c'].shift().astype(float)),
+                abs(df['l'].astype(float) - df['c'].shift().astype(float)),
+            ),
+        )
+        atr = df['tr'].rolling(window=14).mean().iloc[-1]
+        atr_percent = (atr / last_close) * 100
+        if atr_percent > threshold:
+            logger.warning(
+                f"Высокая волатильность: ATR {atr_percent:.2f}% > {threshold}%"
+            )
+            return True
+        return False
+
     async def check_market_gaps(self) -> bool:
-        """Проверяет наличие рыночных гэпов на основе последних свечей."""
+        """Проверяет наличие рыночных гэпов и повышенной волатильности (ATR)."""
         try:
             if len(self.candles_1m) < 10:
                 logger.warning("Недостаточно данных для анализа гэпов")
                 return False
 
             # Конвертируем свечи в DataFrame
-            df = pd.DataFrame(self.candles_1m, columns=['ts', 'o', 'h', 'l', 'c', 'vol', 'volCcy', 'volCcyQuote', 'confirm'])
+            df = pd.DataFrame(
+                self.candles_1m,
+                columns=['ts', 'o', 'h', 'l', 'c', 'vol', 'volCcy', 'volCcyQuote', 'confirm'],
+            )
             df['close'] = df['c'].astype(float)
-
-            # Рассчитываем процентное изменение цены за последнюю минуту
             last_candle = df['close'].iloc[-1]
-            prev_candle = df['close'].iloc[-2]
-            price_change_percent = abs((last_candle - prev_candle) / prev_candle) * 100
 
-            # Порог для гэпа (например, 1%)
-            gap_threshold = 1.0
-            if price_change_percent > gap_threshold:
-                logger.warning(f"Обнаружен рыночный гэп: {price_change_percent:.2f}% > {gap_threshold}%")
+            # Проверяем наличие гэпов
+            if self._has_gap(df):
                 return True
 
-            # Проверка волатильности через ATR (Average True Range)
-            df['tr'] = np.maximum(df['h'].astype(float) - df['l'].astype(float),
-                                  np.maximum(abs(df['h'].astype(float) - df['c'].shift().astype(float)),
-                                            abs(df['l'].astype(float) - df['c'].shift().astype(float))))
-            atr = df['tr'].rolling(window=14).mean().iloc[-1]
-            atr_percent = (atr / last_candle) * 100
-
-            # Порог волатильности (например, 0.5% от текущей цены)
-            volatility_threshold = 0.5
-            if atr_percent > volatility_threshold:
-                logger.warning(f"Высокая волатильность: ATR {atr_percent:.2f}% > {volatility_threshold}%")
+            # Проверяем высокую волатильность через ATR
+            if self._is_high_volatility(df, last_candle):
                 return True
 
             return False
