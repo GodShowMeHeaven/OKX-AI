@@ -7,7 +7,7 @@ import base64
 import time
 import requests
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import openai
@@ -589,29 +589,37 @@ class OKXFuturesBot:
             logger.error(f"Error cancelling order: {e}")
             return False
     
-    async def check_slippage(self, order_id: str, expected_price: float) -> bool:
-        """Проверяет проскальзывание для ордера."""
+    async def check_slippage(self, order_id: str, expected_price: float) -> Tuple[bool, bool]:
+        """Check order fill status and slippage.
+
+        Returns:
+            Tuple[bool, bool]: (is_filled, slippage_ok)
+        """
         try:
             request_path = f"/api/v5/trade/order?ordId={order_id}"
             headers = self.get_headers("GET", request_path)
-            
+
             response = requests.get(self.base_url + request_path, headers=headers)
             if response.status_code == 200:
                 data = response.json()
                 if data['code'] == '0' and data['data']:
                     fill_price = float(data['data'][0].get('fillPx', 0))
-                    if fill_price == 0:  # Ордер ещё не исполнен
-                        return True  # Считаем, что проскальзывания нет, пока ордер не исполнен
+                    if fill_price == 0:
+                        logger.info(f"Order {order_id} not filled yet")
+                        return False, True
+
                     slippage = abs((fill_price - expected_price) / expected_price) * 100
-                    slippage_threshold = 0.5  # Порог проскальзывания 0.5%
+                    slippage_threshold = 0.5  # 0.5% threshold
                     if slippage > slippage_threshold:
-                        logger.warning(f"Проскальзывание {slippage:.2f}% превышает порог {slippage_threshold}%")
-                        return False
-                    return True
-            return False
+                        logger.warning(
+                            f"Проскальзывание {slippage:.2f}% превышает порог {slippage_threshold}%"
+                        )
+                        return True, False
+                    return True, True
+            return False, False
         except Exception as e:
             logger.error(f"Ошибка при проверке проскальзывания: {e}")
-            return False
+            return False, False
     
     async def place_stop_loss_take_profit(self, side: str, size: float, stop_loss: float, take_profit: float):
         """Place stop loss and take profit orders"""
@@ -827,21 +835,21 @@ class OKXFuturesBot:
                     timeout = 30
                     start_time = time.time()
                     while time.time() - start_time < timeout:
-                        order_status = await self.check_slippage(order_id, signal.entry_price)
-                        if order_status:
-                            break
-                        await asyncio.sleep(2)
-                    
+                        filled, slippage_ok = await self.check_slippage(order_id, signal.entry_price)
+                        if not filled:
+                            logger.info(f"Ожидание исполнения ордера {order_id}")
+                            await asyncio.sleep(2)
+                            continue
+                        if not slippage_ok:
+                            logger.warning("Закрытие позиции из-за высокого проскальзывания")
+                            await self.close_position("High Slippage")
+                            return
+                        break
+
                     # Если ордер не исполнен, отменяем его
                     if time.time() - start_time >= timeout:
                         logger.warning(f"Лимитный ордер {order_id} не исполнен за {timeout} секунд, отмена")
                         await self.cancel_order(order_id)
-                        return
-                    
-                    # Проверка проскальзывания
-                    if not await self.check_slippage(order_id, signal.entry_price):
-                        logger.warning("Закрытие позиции из-за высокого проскальзывания")
-                        await self.close_position("High Slippage")
                         return
                     
                     # Place stop loss and take profit
