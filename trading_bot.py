@@ -4,9 +4,7 @@ import json
 import hmac
 import hashlib
 import base64
-import time
 import requests
-from datetime import datetime
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
@@ -98,14 +96,14 @@ class OKXFuturesBot:
         """Get initial historical data via REST API"""
         try:
             # Get 1m candles
-            url_1m = f"{self.base_url}/api/v5/market/history-candles"
+            url = f"{self.base_url}/api/v5/market/history-candles"
             params_1m = {
                 'instId': self.symbol,
                 'bar': '1m',
                 'limit': '200'
             }
-            
-            response_1m = requests.get(url_1m, params=params_1m)
+
+            response_1m = requests.get(url, params=params_1m)
             if response_1m.status_code == 200:
                 data_1m = response_1m.json()
                 if data_1m['code'] == '0':
@@ -118,8 +116,8 @@ class OKXFuturesBot:
                 'bar': '5m',
                 'limit': '100'
             }
-            
-            response_5m = requests.get(url_1m, params=params_5m)
+
+            response_5m = requests.get(url, params=params_5m)
             if response_5m.status_code == 200:
                 data_5m = response_5m.json()
                 if data_5m['code'] == '0':
